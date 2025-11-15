@@ -44,6 +44,7 @@ use parquet::file::metadata::{ColumnChunkMetaData, PageIndexPolicy, ParquetMetaD
 use parquet::file::properties::WriterProperties;
 use parquet::file::reader::ChunkReader;
 use parquet::file::writer::SerializedFileWriter;
+use parquet::schema::types::Type;
 use std::fs::File;
 use std::sync::Arc;
 
@@ -62,6 +63,16 @@ fn read_bloom_filter<R: ChunkReader>(column: &ColumnChunkMetaData, input: &R) ->
     Sbbf::read_from_column_chunk(column, input).ok().flatten()
 }
 
+fn schema_from_file(path: &String) -> Result<Arc<Type>> {
+    let reader = File::open(path)?;
+    let metadata = ParquetMetaDataReader::new()
+        .with_page_index_policy(PageIndexPolicy::Optional)
+        .parse_and_finish(&reader)?;
+    Ok::<Arc<parquet::schema::types::Type>, ParquetError>(
+        metadata.file_metadata().schema_descr().root_schema_ptr(),
+    )
+}
+
 impl Args {
     fn run(&self) -> Result<()> {
         if self.input.is_empty() {
@@ -70,35 +81,23 @@ impl Args {
             ));
         }
 
-        let output = File::create(&self.output)?;
-
-        let schema = {
-            let inputs = self
-                .input
-                .iter()
-                .map(|x| {
-                    let reader = File::open(x)?;
-                    let metadata = ParquetMetaDataReader::new()
-                        .with_page_index_policy(PageIndexPolicy::Optional)
-                        .parse_and_finish(&reader)?;
-                    Ok((reader, metadata))
-                })
-                .collect::<Result<Vec<_>>>()?;
-
-            let expected = inputs[0].1.file_metadata().schema();
-            for metadata in inputs.iter().skip(1) {
-                let actual = metadata.1.file_metadata().schema();
-                if expected != actual {
-                    return Err(ParquetError::General(format!(
-                        "inputs must have the same schema, {expected:#?} vs {actual:#?}"
-                    )));
-                }
+        // Compare schemas in a first pass to make sure they all match
+        let expected = schema_from_file(&self.input[0])?;
+        let other_schemas = self.input[1..].iter().map(|x| (x, schema_from_file(x)));
+        for res_other in other_schemas {
+            let path = res_other.0;
+            let actual = res_other.1?;
+            if actual != expected {
+                return Err(ParquetError::General(format!(
+                    "inputs must have the same schema: file {path}: expected schema {expected:#?} got {actual:#?}"
+                )));
             }
+        }
 
-            inputs[0].1.file_metadata().schema_descr().root_schema_ptr()
-        };
+        // Copy to output file
+        let output = File::create(&self.output)?;
         let props = Arc::new(WriterProperties::builder().build());
-        let mut writer = SerializedFileWriter::new(output, schema, props)?;
+        let mut writer = SerializedFileWriter::new(output, expected, props)?;
 
         self.input
             .iter()
